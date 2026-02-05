@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""
+Handgun Detection Embedded System (Raspberry Pi)
+
+Flow:
+- PIR detects motion
+- On motion: capture frame -> Roboflow inference
+- If handgun/weapon: buzzer + red LED, record 30s video
+- If button pressed during recording: cancel sending (no email, no pushover)
+- If recording completes and not cancelled: send email video + pushover notification
+- Button also resets alarm state back to monitoring
+
+PERSONAL DETAILS:
+- All secrets/emails/keys belong in config.json (placeholders are **LIKE_THIS**).
+"""
+
+import os
+import json
+import time
+import base64
+import smtplib
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from email.message import EmailMessage
+
+import requests
+
+# Camera
+import cv2
+
+# GPIO
+import RPi.GPIO as GPIO
+
+
+# ----------------------------
+# Optional LCD (safe fallback)
+# ----------------------------
+try:
+    from RPLCD.i2c import CharLCD  # type: ignore
+except Exception:
+    CharLCD = None
+
+
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("handgun-detection")
+
+
+# ----------------------------
+# Config structures
+# ----------------------------
+@dataclass
+class RoboflowConfig:
+    enabled: bool
+    api_key: str
+    model: str
+    version: str
+    confidence_threshold: float
+    classes_of_interest: list
+    timeout_seconds: int
+
+
+@dataclass
+class PushoverConfig:
+    enabled: bool
+    user_key: str
+    app_token: str
+    title: str
+    sound: str
+
+
+@dataclass
+class EmailConfig:
+    enabled: bool
+    smtp_host: str
+    smtp_port: int
+    use_tls: bool
+    from_address: str
+    app_password: str
+    to_addresses: list
+    subject_prefix: str
+    body_template: str
+
+
+@dataclass
+class CameraConfig:
+    index: int
+    frame_width: int
+    frame_height: int
+    fps: int
+
+
+@dataclass
+class RecordingConfig:
+    seconds: int
+    output_dir: str
+    filename_prefix: str
+
+
+@dataclass
+class TimingConfig:
+    pir_stabilize_seconds: int
+    pir_cooldown_seconds: int
+    button_debounce_ms: int
+    loop_delay_ms: int
+
+
+@dataclass
+class GPIOConfig:
+    mode: str
+    pir_pin: int
+    button_pin: int
+    button_pull: str
+    led_motion_green_pin: int
+    led_motion_red_pin: int
+    led_result_green_pin: int
+    led_result_red_pin: int
+    buzzer_pin: int
+    active_high_outputs: bool
+
+
+@dataclass
+class LCDConfig:
+    enabled: bool
+    type: str
+    i2c_address: str
+    cols: int
+    rows: int
+
+
+@dataclass
+class AppConfig:
+    gpio: GPIOConfig
+    timing: TimingConfig
+    camera: CameraConfig
+    recording: RecordingConfig
+    roboflow: RoboflowConfig
+    pushover: PushoverConfig
+    email: EmailConfig
+    lcd: LCDConfig
+
+
+def load_config(path: str) -> AppConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    gpio = GPIOConfig(**raw["gpio"])
+    timing = TimingConfig(**raw["timing"])
+    camera = CameraConfig(**raw["camera"])
+    recording = RecordingConfig(**raw["recording"])
+    roboflow = RoboflowConfig(**raw["roboflow"])
+    pushover = PushoverConfig(**raw["pushover"])
+    email = EmailConfig(**raw["email"])
+    lcd = LCDConfig(**raw["lcd"])
+
+    return AppConfig(
+        gpio=gpio,
+        timing=timing,
+        camera=camera,
+        recording=recording,
+        roboflow=roboflow,
+        pushover=pushover,
+        email=email,
+        lcd=lcd
+    )
+
+
+# ----------------------------
+# LCD helpers
+# ----------------------------
+class LCDStatus:
+    def __init__(self, cfg: LCDConfig):
+        self.cfg = cfg
+        self.lcd = None
+
+        if not cfg.enabled:
+            return
+
+        if CharLCD is None:
+            log.warning("LCD enabled in config but RPLCD not installed; continuing without LCD.")
+            return
+
+        if cfg.type.lower() != "i2c":
+            log.warning("Only I2C LCD supported in this script; continuing without LCD.")
+            return
+
+        try:
+            addr_int = int(cfg.i2c_address, 16)
+            self.lcd = CharLCD("PCF8574", address=addr_int, port=1,
+                               cols=cfg.cols, rows=cfg.rows, charmap="A00")
+            self.write("Booting...", "")
+        except Exception as e:
+            log.warning(f"LCD init failed ({e}); continuing without LCD.")
+            self.lcd = None
+
+    def write(self, line1: str, line2: str = ""):
+        if self.lcd is None:
+            return
+        try:
+            self.lcd.clear()
+            self.lcd.write_string(line1[: self.cfg.cols])
+            if self.cfg.rows > 1:
+                self.lcd.crlf()
+                self.lcd.write_string(line2[: self.cfg.cols])
+        except Exception:
+            # Never crash for LCD
+            pass
+
+
+# ----------------------------
+# GPIO helpers
+# ----------------------------
+def setup_gpio(cfg: GPIOConfig):
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM if cfg.mode.upper() == "BCM" else GPIO.BOARD)
+
+    # Inputs
+    pull = GPIO.PUD_DOWN if cfg.button_pull == "PUD_DOWN" else GPIO.PUD_UP
+    GPIO.setup(cfg.pir_pin, GPIO.IN)
+    GPIO.setup(cfg.button_pin, GPIO.IN, pull_up_down=pull)
+
+    # Outputs
+    out_pins = [
+        cfg.led_motion_green_pin, cfg.led_motion_red_pin,
+        cfg.led_result_green_pin, cfg.led_result_red_pin,
+        cfg.buzzer_pin
+    ]
+    for p in out_pins:
+        GPIO.setup(p, GPIO.OUT)
+        GPIO.output(p, GPIO.LOW)
+
+
+def set_outputs(cfg: GPIOConfig, *, motion_green=False, motion_red=False,
+                result_green=False, result_red=False, buzzer=False):
+    # Supports active-high outputs (most common)
+    def to_level(on: bool) -> int:
+        if cfg.active_high_outputs:
+            return GPIO.HIGH if on else GPIO.LOW
+        return GPIO.LOW if on else GPIO.HIGH
+
+    GPIO.output(cfg.led_motion_green_pin, to_level(motion_green))
+    GPIO.output(cfg.led_motion_red_pin, to_level(motion_red))
+    GPIO.output(cfg.led_result_green_pin, to_level(result_green))
+    GPIO.output(cfg.led_result_red_pin, to_level(result_red))
+    GPIO.output(cfg.buzzer_pin, to_level(buzzer))
+
+
+# ----------------------------
+# Roboflow inference
+# ----------------------------
+def roboflow_infer(cfg: RoboflowConfig, frame_bgr) -> tuple[bool, float, str]:
+    """
+    Returns: (detected, best_confidence, best_class)
+    """
+    if not cfg.enabled:
+        return (False, 0.0, "")
+
+    # Encode as JPEG
+    ok, jpg = cv2.imencode(".jpg", frame_bgr)
+    if not ok:
+        raise RuntimeError("Failed to encode frame")
+
+    # Roboflow hosted inference endpoint (common format)
+    # NOTE: Model + version must match your Roboflow deploy info.
+    # If your endpoint differs, update URL accordingly.
+    url = f"https://detect.roboflow.com/{cfg.model}/{cfg.version}?api_key={cfg.api_key}"
+
+    # Send raw bytes as body (Roboflow supports image bytes)
+    r = requests.post(url, data=jpg.tobytes(), headers={"Content-Type": "application/octet-stream"},
+                      timeout=cfg.timeout_seconds)
+    r.raise_for_status()
+    data = r.json()
+
+    predictions = data.get("predictions", []) or []
+    best_conf = 0.0
+    best_class = ""
+
+    for pred in predictions:
+        cls = str(pred.get("class", "")).strip().lower()
+        conf = float(pred.get("confidence", 0.0))
+        if conf > best_conf:
+            best_conf = conf
+            best_class = cls
+
+    # Decide if it's a threat
+    coi = [c.lower() for c in cfg.classes_of_interest]
+    detected = (best_class in coi) and (best_conf >= cfg.confidence_threshold)
+
+    return detected, best_conf, best_class
+
+
+# ----------------------------
+# Pushover
+# ----------------------------
+def send_pushover(cfg: PushoverConfig, message: str):
+    if not cfg.enabled:
+        return
+
+    # Placeholders in config.json:
+    # - cfg.user_key must be **YOUR_PUSHOVER_USER_KEY**
+    # - cfg.app_token must be **YOUR_PUSHOVER_APP_TOKEN**
+    url = "https://api.pushover.net/1/messages.json"
+    payload = {
+        "token": cfg.app_token,
+        "user": cfg.user_key,
+        "title": cfg.title,
+        "message": message,
+        "sound": cfg.sound
+    }
+    r = requests.post(url, data=payload, timeout=10)
+    r.raise_for_status()
+
+
+# ----------------------------
+# Email sending
+# ----------------------------
+def send_email_with_attachment(cfg: EmailConfig, subject: str, body: str, filepath: str):
+    if not cfg.enabled:
+        return
+
+    # Placeholders in config.json:
+    # - cfg.from_address must be **YOUR_SENDER_EMAIL**
+    # - cfg.app_password must be **YOUR_EMAIL_APP_PASSWORD**
+    # - cfg.to_addresses contains **RECIPIENT_EMAILS**
+    msg = EmailMessage()
+    msg["From"] = cfg.from_address
+    msg["To"] = ", ".join(cfg.to_addresses)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    filename = os.path.basename(filepath)
+    with open(filepath, "rb") as f:
+        file_bytes = f.read()
+
+    msg.add_attachment(file_bytes, maintype="video", subtype="mp4", filename=filename)
+
+    with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=20) as server:
+        if cfg.use_tls:
+            server.starttls()
+        server.login(cfg.from_address, cfg.app_password)
+        server.send_message(msg)
+
+
+# ----------------------------
+# Video recording
+# ----------------------------
+def record_video(camera_cfg: CameraConfig, recording_cfg: RecordingConfig, lcd: LCDStatus,
+                 cancel_check_fn) -> tuple[str | None, bool]:
+    """
+    Records for recording_cfg.seconds unless cancel_check_fn() returns True.
+    Returns: (filepath or None, cancelled)
+    """
+    os.makedirs(recording_cfg.output_dir, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{recording_cfg.filename_prefix}{ts}.mp4"
+    filepath = os.path.join(recording_cfg.output_dir, filename)
+
+    cap = cv2.VideoCapture(camera_cfg.index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_cfg.frame_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_cfg.frame_height)
+    cap.set(cv2.CAP_PROP_FPS, camera_cfg.fps)
+
+    if not cap.isOpened():
+        raise RuntimeError("Camera failed to open for recording")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(filepath, fourcc, camera_cfg.fps,
+                             (camera_cfg.frame_width, camera_cfg.frame_height))
+
+    start = time.time()
+    cancelled = False
+
+    lcd.write("Recording...", "Button=Cancel")
+
+    try:
+        while (time.time() - start) < recording_cfg.seconds:
+            if cancel_check_fn():
+                cancelled = True
+                break
+
+            ret, frame = cap.read()
+            if not ret:
+                # If a single frame fails, keep trying briefly
+                time.sleep(0.05)
+                continue
+
+            writer.write(frame)
+            time.sleep(0.0)
+    finally:
+        writer.release()
+        cap.release()
+
+    if cancelled:
+        # Keep file but you can delete if preferred.
+        lcd.write("Cancelled", "No send")
+        return filepath, True
+
+    lcd.write("Recorded", "Sending...")
+    return filepath, False
+
+
+# ----------------------------
+# State machine
+# ----------------------------
+class State:
+    MONITORING = "MONITORING"
+    MOTION = "MOTION"
+    ANALYZE = "ANALYZE"
+    CLEAR = "CLEAR"
+    THREAT = "THREAT"
+
+
+def main():
+    cfg = load_config("config.json")
+    lcd = LCDStatus(cfg.lcd)
+
+    setup_gpio(cfg.gpio)
+
+    # Initial
+    lcd.write("Initializing", "PIR stabilize")
+    set_outputs(cfg.gpio, motion_green=True, motion_red=False, result_green=False, result_red=False, buzzer=False)
+
+    # PIR stabilize
+    stabilize = cfg.timing.pir_stabilize_seconds
+    for i in range(stabilize, 0, -1):
+        lcd.write("Stabilizing PIR", f"{i}s remaining")
+        time.sleep(1)
+
+    lcd.write("Ready", "Monitoring")
+    state = State.MONITORING
+
+    last_motion_time = 0.0
+    last_button_time = 0.0
+
+    def button_pressed() -> bool:
+        nonlocal last_button_time
+        now = time.time()
+        if (now - last_button_time) * 1000 < cfg.timing.button_debounce_ms:
+            return False
+        if GPIO.input(cfg.gpio.button_pin) == GPIO.HIGH:
+            last_button_time = now
+            return True
+        return False
+
+    try:
+        while True:
+            time.sleep(cfg.timing.loop_delay_ms / 1000.0)
+
+            # Global reset behavior: if alarm is active, button resets
+            if state == State.THREAT and button_pressed():
+                log.info("Button pressed: reset from THREAT to MONITORING")
+                lcd.write("Reset", "Monitoring")
+                state = State.MONITORING
+                set_outputs(cfg.gpio, motion_green=True, motion_red=False, result_green=False, result_red=False, buzzer=False)
+                continue
+
+            if state == State.MONITORING:
+                set_outputs(cfg.gpio, motion_green=True, motion_red=False, result_green=False, result_red=False, buzzer=False)
+                lcd.write("Monitoring", "Waiting motion")
+
+                pir = GPIO.input(cfg.gpio.pir_pin) == GPIO.HIGH
+                now = time.time()
+
+                if pir and (now - last_motion_time) >= cfg.timing.pir_cooldown_seconds:
+                    last_motion_time = now
+                    state = State.MOTION
+                    log.info("Motion detected")
+
+            elif state == State.MOTION:
+                set_outputs(cfg.gpio, motion_green=False, motion_red=True, result_green=False, result_red=False, buzzer=False)
+                lcd.write("Motion!", "Capturing...")
+
+                # Capture one frame for analysis
+                cap = cv2.VideoCapture(cfg.camera.index)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.camera.frame_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.camera.frame_height)
+
+                if not cap.isOpened():
+                    log.error("Camera failed to open")
+                    lcd.write("Error", "Camera open")
+                    # Back to monitoring
+                    state = State.MONITORING
+                    continue
+
+                ret, frame = cap.read()
+                cap.release()
+
+                if not ret:
+                    log.error("Camera read failed")
+                    lcd.write("Error", "Camera read")
+                    state = State.MONITORING
+                    continue
+
+                # Store frame for analysis stage
+                last_frame = frame
+                state = State.ANALYZE
+
+            elif state == State.ANALYZE:
+                lcd.write("Analyzing...", "Roboflow")
+                try:
+                    detected, conf, cls = roboflow_infer(cfg.roboflow, last_frame)
+                    log.info(f"Inference: detected={detected}, class={cls}, conf={conf:.3f}")
+                except requests.HTTPError as e:
+                    # Common when key/endpoint wrong: 401, 403, etc.
+                    log.error(f"Roboflow HTTP error: {e}")
+                    lcd.write("Roboflow", "HTTP error")
+                    state = State.MONITORING
+                    continue
+                except Exception as e:
+                    log.error(f"Roboflow error: {e}")
+                    lcd.write("Roboflow", "Error")
+                    state = State.MONITORING
+                    continue
+
+                if detected:
+                    state = State.THREAT
+                    threat_conf = conf
+                else:
+                    state = State.CLEAR
+
+            elif state == State.CLEAR:
+                set_outputs(cfg.gpio, motion_green=False, motion_red=False, result_green=True, result_red=False, buzzer=False)
+                lcd.write("All Clear", "Monitoring")
+                time.sleep(1.5)
+                state = State.MONITORING
+
+            elif state == State.THREAT:
+                set_outputs(cfg.gpio, motion_green=False, motion_red=False, result_green=False, result_red=True, buzzer=True)
+                lcd.write("THREAT!", "Recording...")
+
+                # Record 30 seconds and allow cancel during recording
+                def cancel_check():
+                    return button_pressed()
+
+                try:
+                    filepath, cancelled = record_video(cfg.camera, cfg.recording, lcd, cancel_check)
+                except Exception as e:
+                    log.error(f"Recording error: {e}")
+                    lcd.write("Error", "Recording")
+                    # Stay in THREAT until reset
+                    continue
+
+                if cancelled:
+                    log.info("Recording cancelled by button press; staying in THREAT until reset.")
+                    # Remain in THREAT (alarm stays on) until reset button pressed again
+                    continue
+
+                # Send notifications
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                subj = f"{cfg.email.subject_prefix} ({timestamp})"
+                body = cfg.email.body_template.format(timestamp=timestamp, confidence=f"{threat_conf:.3f}")
+
+                # Email (with attachment)
+                try:
+                    send_email_with_attachment(cfg.email, subj, body, filepath)
+                    log.info("Email sent")
+                except Exception as e:
+                    log.error(f"Email send failed: {e}")
+                    lcd.write("Email", "Failed")
+                    # Continue to pushover attempt anyway
+
+                # Pushover
+                try:
+                    send_pushover(cfg.pushover, f"Weapon detected at {timestamp} (conf {threat_conf:.3f}).")
+                    log.info("Pushover sent")
+                except Exception as e:
+                    log.error(f"Pushover failed: {e}")
+                    lcd.write("Pushover", "Failed")
+
+                # After sending, remain in THREAT until user resets
+                lcd.write("Alert sent", "Press reset")
+
+            else:
+                # Unknown state fallback
+                state = State.MONITORING
+
+    except KeyboardInterrupt:
+        log.info("Exiting on Ctrl+C")
+    finally:
+        set_outputs(cfg.gpio, motion_green=False, motion_red=False, result_green=False, result_red=False, buzzer=False)
+        GPIO.cleanup()
+        lcd.write("Shutdown", "")
+
+
+if __name__ == "__main__":
+    main()

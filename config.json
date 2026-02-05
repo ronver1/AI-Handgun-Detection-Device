@@ -1,0 +1,94 @@
+{
+  "project": {
+    "name": "Handgun Detection Embedded System",
+    "version": "1.0.0"
+  },
+
+  "gpio": {
+  "mode": "BCM",
+
+  "pir_pin": 26,
+
+  "button_pin": 6,
+  "button_pull": "PUD_DOWN",
+
+  "led_motion_green_pin": 22,
+  "led_motion_red_pin": 27,
+
+  "led_result_green_pin": 23,
+  "led_result_red_pin": 24,
+
+  "buzzer_pin": 25,
+
+  "active_high_outputs": true
+}
+
+
+  "timing": {
+    "pir_stabilize_seconds": 30,
+    "pir_cooldown_seconds": 2,
+    "button_debounce_ms": 250,
+    "loop_delay_ms": 50
+  },
+
+  "camera": {
+    "index": 0,
+    "frame_width": 640,
+    "frame_height": 480,
+    "fps": 20
+  },
+
+  "recording": {
+    "seconds": 30,
+    "output_dir": "recordings",
+    "filename_prefix": "threat_"
+  },
+
+  "roboflow": {
+    "enabled": true,
+    "api_key": "**YOUR_ROBOFLOW_API_KEY**",
+    "model": "**YOUR_MODEL_ID**",
+    "version": "**YOUR_MODEL_VERSION**",
+
+    "confidence_threshold": 0.5,
+
+    "classes_of_interest": ["handgun", "gun", "pistol", "weapon"],
+
+    "timeout_seconds": 12
+  },
+
+  "pushover": {
+    "enabled": true,
+    "user_key": "**YOUR_PUSHOVER_USER_KEY**",
+    "app_token": "**YOUR_PUSHOVER_APP_TOKEN**",
+    "title": "Handgun Detection Alert",
+    "sound": "siren"
+  },
+
+  "email": {
+    "enabled": true,
+
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "use_tls": true,
+
+    "from_address": "**YOUR_SENDER_EMAIL**",
+    "app_password": "**YOUR_EMAIL_APP_PASSWORD**",
+
+    "to_addresses": [
+      "**RECIPIENT_EMAIL_1**",
+      "**RECIPIENT_EMAIL_2**"
+    ],
+
+    "subject_prefix": "[ALERT] Handgun Detected",
+    "body_template": "A handgun/weapon was detected by the device.\n\nTimestamp: {timestamp}\nConfidence: {confidence}\n\nAttached: 30-second video clip.\n"
+  },
+
+  "lcd": {
+    "enabled": false,
+    "type": "i2c",
+    "i2c_address": "0x27",
+    "cols": 16,
+    "rows": 2
+  }
+}
