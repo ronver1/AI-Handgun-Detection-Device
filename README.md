@@ -69,6 +69,10 @@ If an error occurs at any time, the Blue LED rapidly flashes and the LCD Display
 - Encrypted video transmission
 - Admin dashboard integration
 
+#### GPIO Pin Mapping
+This project uses BCM GPIO numbering. Pin assignments are defined in `config.json`
+and match the provided KiCad schematic exactly.
+
 ## Summary
 This project showcases a full-stack embedded AI system that bridges hardware, software, and cloud intelligence to address a real-world safety challenge. It is intended as a technical demonstration, research platform, and portfolio artifact for employers and collaborators interested in embedded AI, security systems, and applied computer vision.
 
